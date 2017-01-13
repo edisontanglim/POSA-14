@@ -15,14 +15,12 @@ import android.os.Message;
 import android.os.Messenger;
 import android.os.RemoteException;
 import android.preference.PreferenceManager;
-import android.util.Log;
 
 /**
  * @class UniqueIDGeneratorService
  *
- * @brief This Service generates unique IDs within a pool of Threads.
- *        When it is created, it creates a ThreadPoolExecutor using
- *        the newFixedThreadPool() method of the Executors class.
+ * @brief This Service generates unique IDs via a Thread pool and
+ *        returns the IDs to the UniqueIDGeneratorActivity.
  * 
  *        This class implements the Synchronous Service layer of the
  *        Half-Sync/Half-Async pattern.  It also implements a variant
@@ -35,22 +33,16 @@ public class UniqueIDGeneratorService extends Service {
     private final String TAG = getClass().getName();
 
     /**
-     * A class constant that determines the maximum number of threads
-     * used to service download requests.
+     * String used as a key for the unique ID stored in the reply
+     * Message.
      */
-    private final int MAX_THREADS = 4;
-	
-    /**
-     * The ExecutorService that references a ThreadPool.
-     */
-    private ExecutorService mExecutor;
+    final static String ID = "ID";
 
     /**
-     * A persistent collection of unique IDs.  For simplicity we use a
-     * SharedPreference, which isn't optimized for performance but is
-     * easy to use.
-     */
-    private SharedPreferences uniqueIDs = null;
+     * A RequestHandler that processes Messages from the
+     * UniqueIDGeneratorService within a pool of Threads. 
+     */ 
+    private RequestHandler mRequestHandler = null; 
 
     /**
      * A Messenger that encapsulates the RequestHandler used to handle
@@ -63,19 +55,11 @@ public class UniqueIDGeneratorService extends Service {
      */
     @Override
     public void onCreate() {
-        // A Messenger that encapsulates the RequestHandler used to
-        // handle request Messages sent from the
+        // The Messenger encapsulates the RequestHandler 
+        // used to handle request Messages sent from 
         // UniqueIDGeneratorActivity.
-        mReqMessenger =
-            new Messenger(new RequestHandler());
-
-        // Get a SharedPreferences instance that points to the default
-        // file used by the preference framework in this Service.
-        uniqueIDs = PreferenceManager.getDefaultSharedPreferences(this);
-
-        // Create a FixedThreadPool Executor that's configured to use
-        // MAX_THREADS.
-        mExecutor = Executors.newFixedThreadPool(MAX_THREADS);
+    	mRequestHandler = new RequestHandler();
+        mReqMessenger = new Messenger(mRequestHandler);
     }
 
     /**
@@ -89,19 +73,62 @@ public class UniqueIDGeneratorService extends Service {
     }
 
     /**
-     * Extracts the encapsulated unique ID from the Message.
+     * Extracts the encapsulated unique ID from the reply Message.
      */
-    public static String uniqueID(Message message) {
-        return message.getData().getString("ID");
+    public static String uniqueID(Message replyMessage) {
+        return replyMessage.getData().getString(ID);
     }
 
     /**
      * @class RequestHandler
      *
-     * @brief This class handles messages sent by the
-     *        UniqueIDGeneratorActivity.
+     * @brief This class generates unique IDs via a pool of Threads
+     *        and sends them back to UniqueIDGeneratorActivity. When
+     *        it's created, it creates a ThreadPoolExecutor using the
+     *        newFixedThreadPool() method of the Executors class.
      */
     private class RequestHandler extends Handler {
+        /**
+         * A class constant that determines the maximum number of
+         * threads used to service download requests.
+         */
+        private final int MAX_THREADS = 4;
+	
+        /**
+         * The ExecutorService implementation that references a
+         * ThreadPool.
+         */
+        private ExecutorService mExecutor;
+
+        /**
+         * A collection of unique IDs implemented internally using a
+         * persistent Java HashMap.
+         */
+        private SharedPreferences uniqueIDs = null;
+
+        /**
+         * Initialize RequestHandler to generate IDs concurrently.
+         */
+        public RequestHandler() {
+            // Get a SharedPreferences instance that points to the
+            // default file used by the preference framework in this
+            // Service.
+            uniqueIDs = 
+                PreferenceManager.getDefaultSharedPreferences
+                (UniqueIDGeneratorService.this);
+
+            // Create a FixedThreadPool Executor that's configured to
+            // use MAX_THREADS.
+            mExecutor = 
+                Executors.newFixedThreadPool(MAX_THREADS);
+        }
+
+    	// Ensure threads used by the ThreadPoolExecutor complete and
+    	// are reclaimed by the system.
+        public void shutdown() {
+            mExecutor.shutdown();
+        }
+
         /**
          * Return a Message containing an ID that's unique
          * system-wide.
@@ -109,27 +136,31 @@ public class UniqueIDGeneratorService extends Service {
         private Message generateUniqueID() {
             String uniqueID;
 
-            // This loop keeps generating a random UUID if it's not
-            // unique (i.e., is not currently found in the persistent
-            // collection of SharedPreferences).  The likelihood of a
-            // non-unique UUID is low, but we're being extra paranoid
-            // for the sake of this example ;-)
-            do {
-                uniqueID = UUID.randomUUID().toString();
-            } while (uniqueIDs.getInt(uniqueID, 0) == 1);
+            // Protect critical section to ensure the IDs are unique.
+            synchronized (this) {
+                // This loop keeps generating a random UUID if it's
+                // not unique (i.e., is not currently found in the
+                // persistent collection of SharedPreferences).  The
+                // likelihood of a non-unique UUID is low, but we're
+                // being extra paranoid for the sake of this example
+                // ;-)
+                do {
+                    uniqueID = UUID.randomUUID().toString();
+                } while (uniqueIDs.getInt(uniqueID, 0) == 1);
 
-            // We found a unique ID, so add it as the "key" to the
-            // persistent collection of SharedPreferences, with a
-            // value of 1 to indicate this ID is already "used".
-            SharedPreferences.Editor editor = uniqueIDs.edit();
-            editor.putInt(uniqueID, 1);
-            editor.commit();
+                // We found a unique ID, so add it as the "key" to the
+                // persistent collection of SharedPreferences, with a
+                // value of 1 to indicate this ID is already "used".
+                SharedPreferences.Editor editor = uniqueIDs.edit();
+                editor.putInt(uniqueID, 1);
+                editor.commit();
+            }
 
             // Create a Message that's used to send the unique ID back
             // to the UniqueIDGeneratorActivity.
             Message reply = Message.obtain();
             Bundle data = new Bundle();
-            data.putString("ID", uniqueID);
+            data.putString(ID, uniqueID);
             reply.setData(data);
             return reply;
         }
@@ -143,6 +174,8 @@ public class UniqueIDGeneratorService extends Service {
             // underneath us.
             final Messenger replyMessenger = request.replyTo;
 
+            // Log.d(TAG, "replyMessenger = " + replyMessenger.hashCode());
+
             // Put a runnable that generates a unique ID into the
             // thread pool for subsequent concurrent processing.
             mExecutor.execute(new Runnable() {
@@ -153,6 +186,8 @@ public class UniqueIDGeneratorService extends Service {
                         try {
                             // Send the reply back to the
                             // UniqueIDGeneratorActivity.
+                            // Log.d(TAG, "replyMessenger = " + replyMessenger.hashCode());
+                            // try { Thread.sleep (10000); } catch (InterruptedException e) {}
                             replyMessenger.send(reply);
                         } catch (RemoteException e) {
                             e.printStackTrace();
@@ -169,12 +204,15 @@ public class UniqueIDGeneratorService extends Service {
      */
     @Override
     public void onDestroy() {
-    	// Ensure that the threads used by the ThreadPoolExecutor
-    	// complete and are reclaimed by the system.
-
-        mExecutor.shutdown();
+    	// Ensure threads used by the ThreadPoolExecutor complete and
+    	// are reclaimed by the system.
+        mRequestHandler.shutdown();
     }
 
+    /**
+     * Factory method that returns the underlying IBinder associated
+     * with the Request Messenger.
+     */
     @Override
     public IBinder onBind(Intent intent) {
         return mReqMessenger.getBinder();
